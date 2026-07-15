@@ -39,23 +39,23 @@ if (fs.existsSync(clientDist)) {
 }
 
 async function connect() {
-  // If an explicit MONGODB_URI is set, we REQUIRE it: on failure we exit loudly rather than
-  // silently using an in-memory DB (which would keep the user's data out of Atlas). Set
-  // MONGODB_ALLOW_MEMORY_FALLBACK=1 to opt back into the old silent-fallback behavior.
+  // With an explicit MONGODB_URI we try Atlas first. If it fails we DO NOT crash the process
+  // (that would take a production site down); instead we log a loud warning and stay up on a
+  // temporary in-memory DB — so the site keeps serving, but data won't persist until Atlas is
+  // reachable. Set MONGODB_STRICT=1 to exit on failure instead (e.g. in CI / strict deploys).
   if (MONGODB_URI) {
     try {
       await connectDB(MONGODB_URI);
       return;
     } catch (err) {
-      console.error(`[server] FAILED to connect to MONGODB_URI: ${err.message}`);
-      if (process.env.MONGODB_ALLOW_MEMORY_FALLBACK === '1') {
-        console.warn('[server] MONGODB_ALLOW_MEMORY_FALLBACK=1 → using TEMPORARY in-memory DB (data will NOT reach Atlas).');
-        await connectMemoryDB();
-        return;
-      }
-      console.error('[server] Refusing to start on a temporary in-memory DB (your data would not persist to Atlas).');
-      console.error('[server] Check: Atlas Network Access IP allowlist, credentials, and DNS. Then restart.');
-      throw err;
+      console.error('==================================================================');
+      console.error(`[server] COULD NOT CONNECT TO MONGODB_URI: ${err.message}`);
+      console.error('[server] Data will NOT persist. Check the Atlas IP allowlist, credentials, and DNS.');
+      console.error('[server] Running on a TEMPORARY in-memory DB so the site stays up. Fix + restart to persist.');
+      console.error('==================================================================');
+      if (process.env.MONGODB_STRICT === '1') throw err;
+      await connectMemoryDB();
+      return;
     }
   }
   console.log('[server] no MONGODB_URI set — starting in-memory MongoDB (zero-setup mode).');
