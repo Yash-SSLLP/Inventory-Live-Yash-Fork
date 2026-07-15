@@ -186,6 +186,19 @@
   td.cat { color: var(--text-2); font-size: 11px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   tr:hover td { background: var(--panel-2); }
 
+  /* Processing loader overlay */
+  #processingOverlay { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; background: rgba(10,10,14,0.72); backdrop-filter: blur(2px); }
+  #processingOverlay .proc-box { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 28px 40px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  #processingOverlay .proc-spinner { width: 40px; height: 40px; border: 3px solid var(--line-2); border-top-color: var(--accent); border-radius: 50%; animation: procspin 0.8s linear infinite; }
+  #processingOverlay .proc-msg { font-family: var(--mono); font-size: 12px; color: var(--text-2); letter-spacing: 0.03em; text-align: center; max-width: 360px; }
+  @keyframes procspin { to { transform: rotate(360deg); } }
+
+  /* Cleaned Product Master preview (Section 07) */
+  #masterPreview .master-preview-summary { font-size: 12px; color: var(--text-2); }
+  #masterPreview .master-preview-table td:nth-child(2) { font-weight: 500; color: var(--text); }
+  #masterPreview .master-preview-table td:nth-child(3),
+  #masterPreview .master-preview-table td:nth-child(5) { color: var(--text-2); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); margin-bottom: 20px; flex-wrap: wrap; }
   .tab { padding: 12px 20px; font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-3); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all 0.2s; user-select: none; }
   .tab:hover { color: var(--text-2); }

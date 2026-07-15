@@ -35,6 +35,27 @@ const fmtCompact = (n) => (n == null || n === 0) ? null : Number(n).toLocaleStri
 const fmtDays = (n) => n == null ? '—' : (n >= 999 ? '∞' : Math.round(n));
 const fmtMonthsSinceSale = (n) => n == null ? '—' : (n >= 13 ? '13+' : n);
 
+// ===== Processing loader (shown while an uploaded file is parsed/cleaned and the dashboard rebuilt) =====
+function showLoader(msg) {
+  const el = document.getElementById('processingOverlay');
+  if (!el) return;
+  const m = document.getElementById('processingMsg');
+  if (m) m.textContent = msg || 'Processing…';
+  el.style.display = 'flex';
+}
+function hideLoader() {
+  const el = document.getElementById('processingOverlay');
+  if (el) el.style.display = 'none';
+}
+// Show the loader, let the browser paint it (double rAF) BEFORE starting the heavy synchronous
+// parse/rebuild that would otherwise block the first paint, then run `work` (may return a promise).
+function runWithLoader(msg, work) {
+  showLoader(msg);
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    Promise.resolve().then(work).catch(err => { console.error(err); }).finally(hideLoader);
+  }));
+}
+
 const STATUS = D.statusCodes;
 const MOVERS = D.moverCodes;
 const PRIORITIES = D.priorityCodes;
@@ -54,6 +75,27 @@ function parentCodeBase(name) {
 const reorderEdits = {};
 // Master mapping override (parentId -> {parentCode, children:[{code, folder, variant}]})
 let masterOverride = null;
+
+// ===== Real-data mode =====
+// When the user uploads a RAW Product Master, we stop overlaying the synthetic demo catalog and
+// instead BUILD the whole dataset `D` from their uploads. This holds the cleaned inputs the
+// rebuild pipeline consumes; sales/purchase are kept as full month-keyed maps so the 24-month
+// window can shift to the latest data. Upsert semantics: re-uploading a month overwrites it.
+let realDataMode = false;
+const realData = {
+  masterMap: null,     // parentId -> { parentCode, vendorName, categoryName, productType, parentLaunchDate, children:[{code,launchDate}] }
+  salesByMonth: {},    // UPPER(parentCode) -> { 'yyyy-mm': qty }
+  purchByMonth: {},    // UPPER(parentCode) -> { 'yyyy-mm': qty }
+  stockByCode: {},     // UPPER(parentCode) -> { k, it, po }
+};
+// Merge a per-file month map into a running store, overwriting months present in the new file
+// (same month → replace) and keeping the rest (new month → merge).
+function mergeMonthMaps(target, incoming) {
+  Object.keys(incoming || {}).forEach(code => {
+    if (!target[code]) target[code] = {};
+    Object.assign(target[code], incoming[code]);
+  });
+}
 // Folder → zone mapping. Each folder is either: in N specific zones (1..6), OPEN to all, or UNCLASSIFIED (no entry).
 //   folderZones['Coats']   = { zones: [1, 3], openToAll: false }
 //   folderZones['Trims']   = { zones: [],     openToAll: true  }
@@ -89,6 +131,32 @@ try {
 } catch (e) {}
 function saveParentLaunchDates() {
   try { localStorage.setItem('inventoryParentLaunchDates', JSON.stringify(parentLaunchDates)); } catch (e) {}
+}
+// Product Type per parent — keyed by parent_code (uppercase, trimmed). Populated from the raw
+// Product Master. Kept as its own field (NOT the sub-category) so the UI can surface it separately.
+const parentProductTypes = {};
+try {
+  const savedPT = localStorage.getItem('inventoryParentProductTypes');
+  if (savedPT) Object.assign(parentProductTypes, JSON.parse(savedPT) || {});
+} catch (e) {}
+function saveParentProductTypes() {
+  try { localStorage.setItem('inventoryParentProductTypes', JSON.stringify(parentProductTypes)); } catch (e) {}
+}
+function getParentProductType(p) {
+  if (!p) return '';
+  const key = (p.n || '').toUpperCase().trim();
+  return parentProductTypes[key] || '';
+}
+// ProductId → parent Product Name (identity code) index. Built from the raw Product Master
+// (every ProductId, parent or child, maps to its parent's Product Name). Lets the raw Purchase /
+// Sales cleaners resolve a transaction's numeric PID to the parent code the dashboard matches on.
+const productIdToParentCode = {};
+try {
+  const savedIdx = localStorage.getItem('inventoryProductIdParentIndex');
+  if (savedIdx) Object.assign(productIdToParentCode, JSON.parse(savedIdx) || {});
+} catch (e) {}
+function saveProductIdIndex() {
+  try { localStorage.setItem('inventoryProductIdParentIndex', JSON.stringify(productIdToParentCode)); } catch (e) {}
 }
 function getParentLaunchDate(p) {
   if (!p) return '';
@@ -266,35 +334,14 @@ function saveEdits() {
   try { localStorage.setItem('inventoryReorderEdits', JSON.stringify(reorderEdits)); } catch (e) {}
 }
 
-// ===== KPIs =====
-const k = D.kpi;
-const kpiHtml = [
-  { label: 'Parents · Children', value: fmt(k.totalProducts) + ' · ' + fmt(k.totalChildren), sub: k.totalFolders + ' folders · ' + k.totalCategories + ' categories', cls: '' },
-  { label: 'Annual sales (units)', value: fmt(k.annualSales), sub: 'Apr 25 — Apr 26', cls: 'good' },
-  { label: 'On hand · Pipeline', value: fmt(k.totalStock), sub: '+' + fmt(k.inTransitTotal) + ' transit · +' + fmt(k.pendingTotal) + ' pending', cls: 'info' },
-  { label: 'Class A SKUs', value: fmt(k.classACount), sub: '80% of revenue · ' + (k.totalProducts ? Math.round(k.classACount/k.totalProducts*100) : 0) + '% of SKUs', cls: 'info' },
-  { label: 'Net reorder need', value: fmt(k.netReorderQty), sub: fmt(k.netReorderProducts) + ' SKUs · saved ' + fmt(k.reorderSavedByPipeline) + ' from pipeline', cls: 'warn' },
-  { label: 'Critical stock', value: fmt(k.criticalCount), sub: 'less than 15 days cover · ' + fmt(k.criticalImprovedCount) + ' covered by pipeline', cls: 'danger' },
-  { label: 'Bulk-order anomalies', value: fmt(k.bulkAnomalyCount), sub: 'unusual purchase spikes', cls: 'warn' },
-  { label: 'Slow / Non-moving', value: fmt(k.slowMoverCount), sub: fmt(k.nonMovingUnits) + ' units stuck', cls: 'danger' },
-];
-document.getElementById('kpis').innerHTML = kpiHtml.map((x, i) =>
-  `<div class="kpi ${x.cls} reveal reveal-${(i % 3) + 1}">
-    <div class="kpi-label">${x.label}</div>
-    <div class="kpi-value">${x.value}</div>
-    <div class="kpi-sub">${x.sub}</div>
-  </div>`).join('');
-
-// ===== Insights =====
-document.getElementById('aggInsightText').innerHTML =
-  `Across all SKUs, total purchases of <strong>${fmt(D.aggP.reduce((a,b)=>a+b,0))}</strong> units against sales of <strong>${fmt(D.aggS.reduce((a,b)=>a+b,0))}</strong> units in 24 months. Class A drives <strong>${fmt(k.classASales)}</strong> units (<strong>${k.annualSales ? Math.round(k.classASales/k.annualSales*100) : 0}%</strong>) from just <strong>${fmt(k.classACount)}</strong> SKUs.`;
-
-document.getElementById('actionInsightText').innerHTML =
-  `<strong>${fmt(k.criticalCount)}</strong> critical-stock SKUs detected — but <strong>${fmt(k.criticalImprovedCount)}</strong> of those have stock already in transit or pending at factory. Net reorder need after accounting for pipeline: <strong>${fmt(k.netReorderQty)}</strong> units across <strong>${fmt(k.netReorderProducts)}</strong> SKUs (saved <strong>${fmt(k.reorderSavedByPipeline)}</strong> units of double-ordering). <strong>${fmt(k.bulkAnomalyCount)}</strong> SKUs show bulk-purchase spikes worth reviewing.`;
-
-// ===== Charts (wrapped — CDN failure must not break the rest of the page) =====
+// ===== KPI cards + insights + charts =====
+// Wrapped in renderHeaderAndCharts() so a rebuild from uploaded data can refresh them in place
+// (they otherwise render only once at load and are NOT touched by rerender()).
 const tooltipStyle = () => ({ backgroundColor: '#1c1c22', titleColor: '#fff', bodyColor: '#a8a8b3', borderColor: '#34343e', borderWidth: 1, padding: 12, displayColors: true, titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'Inter', size: 12 } });
 
+// Chart.js instances kept so we can destroy + recreate on rebuild (a new Chart on a canvas
+// already in use throws "Canvas is already in use").
+const _dashCharts = {};
 function safeChart(elemId, config) {
   try {
     if (typeof Chart === 'undefined') {
@@ -308,55 +355,87 @@ function safeChart(elemId, config) {
   }
 }
 
-safeChart('aggChart', {
-  data: {
-    labels: D.months,
-    datasets: [
-      { type: 'bar', label: 'Purchases', data: D.aggP, backgroundColor: 'rgba(255, 92, 58, 0.55)', borderColor: 'rgba(255, 92, 58, 0.85)', borderWidth: 1, order: 2 },
-      { type: 'line', label: 'Sales', data: D.aggS, borderColor: '#d4ff3a', backgroundColor: 'rgba(212,255,58,0.08)', borderWidth: 2.5, tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#d4ff3a', pointBorderWidth: 0, order: 1 }
-    ]
-  },
-  options: {
-    responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
-    plugins: { legend: { labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 12 } }, tooltip: tooltipStyle() },
-    scales: {
-      x: { grid: { color: '#1c1c22' }, ticks: { color: '#6b6b78', font: { family: 'JetBrains Mono', size: 10 } } },
-      y: { grid: { color: '#1c1c22' }, ticks: { color: '#6b6b78', font: { family: 'JetBrains Mono', size: 10 }, callback: v => (v/1000).toFixed(0)+'k' }, beginAtZero: true }
+function renderHeaderAndCharts() {
+  const k = D.kpi || {};
+  const M = D.months || [];
+  const salesWindowSub = M.length >= 12 ? `${M[M.length - 12]} — ${M[M.length - 1]}` : (M.length ? `${M[0]} — ${M[M.length - 1]}` : '');
+  const kpiHtml = [
+    { label: 'Parents · Children', value: fmt(k.totalProducts) + ' · ' + fmt(k.totalChildren), sub: k.totalFolders + ' folders · ' + k.totalCategories + ' categories', cls: '' },
+    { label: 'Annual sales (units)', value: fmt(k.annualSales), sub: salesWindowSub, cls: 'good' },
+    { label: 'On hand · Pipeline', value: fmt(k.totalStock), sub: '+' + fmt(k.inTransitTotal) + ' transit · +' + fmt(k.pendingTotal) + ' pending', cls: 'info' },
+    { label: 'Class A SKUs', value: fmt(k.classACount), sub: '80% of revenue · ' + (k.totalProducts ? Math.round(k.classACount/k.totalProducts*100) : 0) + '% of SKUs', cls: 'info' },
+    { label: 'Net reorder need', value: fmt(k.netReorderQty), sub: fmt(k.netReorderProducts) + ' SKUs · saved ' + fmt(k.reorderSavedByPipeline) + ' from pipeline', cls: 'warn' },
+    { label: 'Critical stock', value: fmt(k.criticalCount), sub: 'less than 15 days cover · ' + fmt(k.criticalImprovedCount) + ' covered by pipeline', cls: 'danger' },
+    { label: 'Bulk-order anomalies', value: fmt(k.bulkAnomalyCount), sub: 'unusual purchase spikes', cls: 'warn' },
+    { label: 'Slow / Non-moving', value: fmt(k.slowMoverCount), sub: fmt(k.nonMovingUnits) + ' units stuck', cls: 'danger' },
+  ];
+  document.getElementById('kpis').innerHTML = kpiHtml.map((x, i) =>
+    `<div class="kpi ${x.cls} reveal reveal-${(i % 3) + 1}">
+      <div class="kpi-label">${x.label}</div>
+      <div class="kpi-value">${x.value}</div>
+      <div class="kpi-sub">${x.sub}</div>
+    </div>`).join('');
+
+  document.getElementById('aggInsightText').innerHTML =
+    `Across all SKUs, total purchases of <strong>${fmt(D.aggP.reduce((a,b)=>a+b,0))}</strong> units against sales of <strong>${fmt(D.aggS.reduce((a,b)=>a+b,0))}</strong> units in 24 months. Class A drives <strong>${fmt(k.classASales)}</strong> units (<strong>${k.annualSales ? Math.round(k.classASales/k.annualSales*100) : 0}%</strong>) from just <strong>${fmt(k.classACount)}</strong> SKUs.`;
+
+  document.getElementById('actionInsightText').innerHTML =
+    `<strong>${fmt(k.criticalCount)}</strong> critical-stock SKUs detected — but <strong>${fmt(k.criticalImprovedCount)}</strong> of those have stock already in transit or pending at factory. Net reorder need after accounting for pipeline: <strong>${fmt(k.netReorderQty)}</strong> units across <strong>${fmt(k.netReorderProducts)}</strong> SKUs (saved <strong>${fmt(k.reorderSavedByPipeline)}</strong> units of double-ordering). <strong>${fmt(k.bulkAnomalyCount)}</strong> SKUs show bulk-purchase spikes worth reviewing.`;
+
+  // Destroy existing chart instances before recreating (canvas-reuse guard)
+  ['agg', 'status', 'abc', 'mover'].forEach(id => { const c = _dashCharts[id]; if (c) { try { c.destroy(); } catch (e) {} } _dashCharts[id] = null; });
+
+  _dashCharts.agg = safeChart('aggChart', {
+    data: {
+      labels: D.months,
+      datasets: [
+        { type: 'bar', label: 'Purchases', data: D.aggP, backgroundColor: 'rgba(255, 92, 58, 0.55)', borderColor: 'rgba(255, 92, 58, 0.85)', borderWidth: 1, order: 2 },
+        { type: 'line', label: 'Sales', data: D.aggS, borderColor: '#d4ff3a', backgroundColor: 'rgba(212,255,58,0.08)', borderWidth: 2.5, tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#d4ff3a', pointBorderWidth: 0, order: 1 }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 12 } }, tooltip: tooltipStyle() },
+      scales: {
+        x: { grid: { color: '#1c1c22' }, ticks: { color: '#6b6b78', font: { family: 'JetBrains Mono', size: 10 } } },
+        y: { grid: { color: '#1c1c22' }, ticks: { color: '#6b6b78', font: { family: 'JetBrains Mono', size: 10 }, callback: v => (v/1000).toFixed(0)+'k' }, beginAtZero: true }
+      }
     }
-  }
-});
+  });
 
-const statusOrder = STATUS.filter(s => s !== 'Inactive');
-const statusColors = { 'Critical':'#ff4a5c','Low Stock':'#ffa83a','Healthy':'#3affb6','Adequate':'#5cabff','Overstocked':'#b88aff','Dead Stock':'#6b6b78','Inactive':'#34343e' };
-const statusCount = {};
-D.products.forEach(p => { const s = STATUS[p.st]; statusCount[s] = (statusCount[s] || 0) + 1; });
-safeChart('statusChart', {
-  type: 'doughnut',
-  data: { labels: statusOrder, datasets: [{ data: statusOrder.map(s => statusCount[s] || 0), backgroundColor: statusOrder.map(s => statusColors[s]), borderWidth: 0, hoverOffset: 8 }] },
-  options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
-    plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
-      tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) } } } }
-});
+  const statusOrder = STATUS.filter(s => s !== 'Inactive');
+  const statusColors = { 'Critical':'#ff4a5c','Low Stock':'#ffa83a','Healthy':'#3affb6','Adequate':'#5cabff','Overstocked':'#b88aff','Dead Stock':'#6b6b78','Inactive':'#34343e' };
+  const statusCount = {};
+  D.products.forEach(p => { const s = STATUS[p.st]; statusCount[s] = (statusCount[s] || 0) + 1; });
+  _dashCharts.status = safeChart('statusChart', {
+    type: 'doughnut',
+    data: { labels: statusOrder, datasets: [{ data: statusOrder.map(s => statusCount[s] || 0), backgroundColor: statusOrder.map(s => statusColors[s]), borderWidth: 0, hoverOffset: 8 }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
+        tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) } } } }
+  });
 
-safeChart('abcChart', {
-  type: 'doughnut',
-  data: { labels: ['Class A', 'Class B', 'Class C'], datasets: [{ data: [k.classACount, k.classBCount, k.classCCount], backgroundColor: ['#d4ff3a', 'rgba(212,255,58,0.45)', '#34343e'], borderWidth: 0, hoverOffset: 8 }] },
-  options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
-    plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
-      tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) + ' SKUs' } } } }
-});
+  _dashCharts.abc = safeChart('abcChart', {
+    type: 'doughnut',
+    data: { labels: ['Class A', 'Class B', 'Class C'], datasets: [{ data: [k.classACount, k.classBCount, k.classCCount], backgroundColor: ['#d4ff3a', 'rgba(212,255,58,0.45)', '#34343e'], borderWidth: 0, hoverOffset: 8 }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
+        tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) + ' SKUs' } } } }
+  });
 
-const moverOrder = ['Active', 'Sluggish (3-6m)', 'Slow (6-12m)', 'Non-Moving (12m+)', 'No Stock'];
-const moverCount = {};
-D.products.forEach(p => { const m = MOVERS[p.mv]; moverCount[m] = (moverCount[m] || 0) + 1; });
-const moverColors = { 'Active':'#3affb6', 'Sluggish (3-6m)':'#ffa83a', 'Slow (6-12m)':'#ff5c3a', 'Non-Moving (12m+)':'#ff4a5c', 'No Stock':'#6b6b78' };
-safeChart('moverChart', {
-  type: 'doughnut',
-  data: { labels: moverOrder, datasets: [{ data: moverOrder.map(m => moverCount[m] || 0), backgroundColor: moverOrder.map(m => moverColors[m]), borderWidth: 0, hoverOffset: 8 }] },
-  options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
-    plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
-      tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) + ' SKUs' } } } }
-});
+  const moverOrder = ['Active', 'Sluggish (3-6m)', 'Slow (6-12m)', 'Non-Moving (12m+)', 'No Stock'];
+  const moverCount = {};
+  D.products.forEach(p => { const m = MOVERS[p.mv]; moverCount[m] = (moverCount[m] || 0) + 1; });
+  const moverColors = { 'Active':'#3affb6', 'Sluggish (3-6m)':'#ffa83a', 'Slow (6-12m)':'#ff5c3a', 'Non-Moving (12m+)':'#ff4a5c', 'No Stock':'#6b6b78' };
+  _dashCharts.mover = safeChart('moverChart', {
+    type: 'doughnut',
+    data: { labels: moverOrder, datasets: [{ data: moverOrder.map(m => moverCount[m] || 0), backgroundColor: moverOrder.map(m => moverColors[m]), borderWidth: 0, hoverOffset: 8 }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: { legend: { position: 'bottom', labels: { color: '#a8a8b3', font: { family: 'JetBrains Mono', size: 9 }, boxWidth: 10, padding: 10 } },
+        tooltip: { ...tooltipStyle(), callbacks: { label: c => c.label + ': ' + fmt(c.raw) + ' SKUs' } } } }
+  });
+}
+renderHeaderAndCharts();
 
 // ===== Filters setup =====
 // Wrap the category + vendor datalists in a refresher so they update after Master sync.
@@ -3746,11 +3825,16 @@ function parseCSVLine(line) {
 
 function applyMasterOverride(map, sourceLabel, zonesByFolder) {
   masterOverride = map;
-  applyVendorOverrides(map);
-  applyCategoryOverrides(map);
-  applySubCategoryOverrides(map);
+  // In real-data mode the whole catalog is rebuilt from the uploads, so the demo-catalog
+  // overlays (which mutate the synthetic D.products by id) are skipped — they'd be discarded.
+  if (!realDataMode) {
+    applyVendorOverrides(map);
+    applyCategoryOverrides(map);
+    applySubCategoryOverrides(map);
+  }
   // Pull parent launch dates out of the master map into our keyed cache so all UI can read them
   let parentDateCount = 0;
+  let parentTypeCount = 0;
   Object.keys(map).forEach(pidKey => {
     const entry = map[pidKey];
     if (!entry) return;
@@ -3759,8 +3843,14 @@ function applyMasterOverride(map, sourceLabel, zonesByFolder) {
       parentLaunchDates[parentKey] = entry.parentLaunchDate;
       parentDateCount++;
     }
+    // Product Type (raw Product Master only) — kept as its own field
+    if (parentKey && entry.productType) {
+      parentProductTypes[parentKey] = entry.productType;
+      parentTypeCount++;
+    }
   });
   if (parentDateCount > 0) saveParentLaunchDates();
+  if (parentTypeCount > 0) saveParentProductTypes();
   // Apply zone mappings if provided
   let zoneFoldersUpdated = 0;
   if (zonesByFolder && typeof zonesByFolder === 'object') {
@@ -3779,13 +3869,203 @@ function applyMasterOverride(map, sourceLabel, zonesByFolder) {
   document.getElementById('uploadStatus').innerHTML = `<strong>Custom mapping loaded</strong> from ${sourceLabel} — <strong style="color:var(--accent)">${fmt(parentCount)}</strong> parents, <strong style="color:var(--accent)">${fmt(childCount)}</strong> child codes${vendorNote}${zoneNote}`;
   document.getElementById('uploadStatus').classList.add('loaded');
   document.getElementById('masterReset').style.display = '';
-  try { localStorage.setItem('inventoryMasterOverride', JSON.stringify(map)); } catch (e) {}
-  renderFolderView();
-  // Vendors/categories may have changed → refresh vendor + category datalists AND the vendor analytics panel
-  if (typeof refreshFilterDatalists === 'function') refreshFilterDatalists();
-  if (typeof renderVendors === 'function') renderVendors();
-  if (typeof renderZoneBrowser === 'function') renderZoneBrowser();
-  rerender();
+  // Only persist the (bulky) master map in demo mode. In real-data mode the cleaned catalog is
+  // stored whole via PUT /api/data and the map is reconstructed from it on reload — so we keep
+  // MongoDB holding ONLY cleaned data (no redundant raw-ish blob) → faster retrieval.
+  if (!realDataMode) { try { localStorage.setItem('inventoryMasterOverride', JSON.stringify(map)); } catch (e) {} }
+  // In real-data mode the caller runs rebuildDashboardFromUploads() which refreshes every view;
+  // skip the demo-catalog re-renders here to avoid rendering the stale synthetic catalog.
+  if (!realDataMode) {
+    renderFolderView();
+    // Vendors/categories may have changed → refresh vendor + category datalists AND the vendor analytics panel
+    if (typeof refreshFilterDatalists === 'function') refreshFilterDatalists();
+    if (typeof renderVendors === 'function') renderVendors();
+    if (typeof renderZoneBrowser === 'function') renderZoneBrowser();
+    rerender();
+  }
+}
+
+// ===== Raw "Product Master" export → cleaned parent/child map =====
+// The ERP exports a wide (130+ column) raw file. We auto-detect it, keep only the fields that
+// matter, resolve the parent↔child relationship, and produce the SAME map shape parseMasterCSV
+// returns so the rest of the pipeline (applyMasterOverride) is unchanged.
+
+// Reads a master file into BOTH a CSV-text form (for the clean-schema parser) and an array of
+// row objects (for the raw transformer). Row objects avoid the fragility of flattening 130
+// quoted columns to CSV. Used by both the Master and Purchase raw-upload paths.
+function readUploadFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) { reject(new Error('No file selected')); return; }
+    const isExcel = /\.(xlsx|xls)$/i.test(file.name);
+    const reader = new FileReader();
+    if (isExcel) {
+      if (typeof XLSX === 'undefined') {
+        reject(new Error('Excel parser is still loading — please retry, or save the file as CSV'));
+        return;
+      }
+      reader.onload = (e) => {
+        try {
+          const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+          if (!wb.SheetNames || wb.SheetNames.length === 0) throw new Error('Workbook has no sheets');
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          const objects = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+          // A huge worksheet (its XML > the browser's ~512 MB max string length) makes SheetJS
+          // silently yield 0 rows and no '!ref'. Detect that and give an actionable message
+          // instead of a confusing downstream "no header row" error.
+          if (!objects.length && !sheet['!ref']) {
+            const mb = (e.target.result.byteLength || 0) / 1048576;
+            reject(new Error(mb > 40
+              ? `This Excel file is too large for in-browser parsing (${mb.toFixed(0)} MB — its internal sheet data exceeds the browser's ~512 MB limit). Re-save it as CSV and upload that, or export just these columns: Date, Product, Product Code, Qty, Company Name, PID.`
+              : 'No rows found in the first sheet of this Excel file.'));
+            return;
+          }
+          const csvText = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          resolve({ objects, csvText });
+        } catch (err) { reject(err); }
+      };
+      reader.onerror = () => reject(new Error('Error reading Excel file'));
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = (e) => {
+        const text = e.target.result || '';
+        resolve({ objects: csvTextToObjects(text), csvText: text });
+      };
+      reader.onerror = () => reject(new Error('Error reading CSV file'));
+      reader.readAsText(file);
+    }
+  });
+}
+function csvTextToObjects(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = parseCSVLine(lines[0]);
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = parseCSVLine(lines[i]);
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = parts[idx] != null ? parts[idx] : ''; });
+    out.push(obj);
+  }
+  return out;
+}
+// Raw Product Master is identified by its ERP header names.
+function isRawProductMaster(objects) {
+  if (!objects || !objects.length) return false;
+  const keys = Object.keys(objects[0]).map(k => String(k).trim().toLowerCase());
+  return keys.includes('productid') && keys.includes('parent product') && keys.includes('product name');
+}
+// Transform raw rows → { map, stats }. Identity/code = Product Name (per user's decision).
+function transformProductMasterRaw(objects) {
+  const empty = { map: {}, stats: { parents: 0, children: 0, standalone: 0 } };
+  if (!objects || !objects.length) return empty;
+  const sampleKeys = Object.keys(objects[0]);
+  const findKey = (target) => sampleKeys.find(k => String(k).trim().toLowerCase() === target) || null;
+  const kId     = findKey('productid');
+  const kName   = findKey('product name');
+  const kParent = findKey('parent product');
+  const kSupp   = findKey('suppliername');
+  const kDate   = findKey('creationdate');
+  const kCat    = findKey('category');
+  const kType   = findKey('product type');
+  const kStock  = findKey('stock');   // parent-level on-hand (used as initial stock in real-data mode)
+  if (!kId || !kName || !kParent) return empty;
+
+  const str = (v) => (v == null ? '' : String(v).trim());
+  const num = (v) => { const n = parseInt(v, 10); return isNaN(n) ? null : n; };
+
+  // Index every row by ProductId so we can look up a child's parent row (and detect orphans).
+  const byId = {};
+  objects.forEach(r => { const id = num(r[kId]); if (id != null) byId[id] = r; });
+
+  const map = {};
+  const idIndex = {};   // every ProductId (parent or child) → its parent's Product Name (identity code)
+  let children = 0, standalone = 0;
+  function ensureParent(pid) {
+    if (map[pid]) return map[pid];
+    const prow = byId[pid];
+    map[pid] = {
+      parentCode: prow ? str(prow[kName]) : '',
+      vendorName: prow ? str(prow[kSupp]) : '',
+      parentLaunchDate: prow ? str(prow[kDate]) : '',
+      categoryName: prow ? str(prow[kCat]) : '',
+      productType: prow ? str(prow[kType]) : '',
+      stock: (prow && kStock) ? (parseInt(prow[kStock], 10) || 0) : 0,
+      children: [],
+    };
+    return map[pid];
+  }
+
+  objects.forEach(r => {
+    const id = num(r[kId]);
+    if (id == null) return;
+    const ppRaw = num(r[kParent]);
+    // Effective parent: a valid, non-zero Parent Product that exists in the file → that parent;
+    // otherwise (blank / 0 / orphan) the product is STANDALONE — its own parent. (Nothing dropped.)
+    const hasParent = (ppRaw != null && ppRaw !== 0 && byId[ppRaw]);
+    const pid = hasParent ? ppRaw : id;
+    if (!hasParent) standalone++;
+    const parent = ensureParent(pid);
+    parent.children.push({
+      code: str(r[kName]),
+      folder: '',
+      variant: 'Standard',
+      launchDate: str(r[kDate]),
+    });
+    // Map this row's own ProductId → its parent's Product Name (used by Purchase/Sales/Stock cleaners).
+    if (parent.parentCode) idIndex[id] = parent.parentCode;
+    children++;
+  });
+
+  return { map, idIndex, stats: { parents: Object.keys(map).length, children, standalone } };
+}
+// Build a downloadable cleaned file in the dashboard's clean schema (+ product_type).
+function downloadCleanedMaster(map) {
+  const headers = ['parent_id', 'parent_code', 'parent_launch_date', 'vendor_name', 'category', 'product_type', 'child_code', 'child_launch_date'];
+  const rows = [headers];
+  Object.keys(map).forEach(pid => {
+    const e = map[pid];
+    e.children.forEach(ch => {
+      rows.push([pid, e.parentCode, e.parentLaunchDate, e.vendorName, e.categoryName, e.productType, ch.code, ch.launchDate]);
+    });
+  });
+  downloadXlsx('Cleaned_Product_Master.xlsx', 'Cleaned Master', rows);
+}
+// Render the cleaned-data preview (summary + scrollable sample of the first 200 parents).
+function renderMasterPreview(stats, map) {
+  const el = document.getElementById('masterPreview');
+  if (!el) return;
+  const escHtml = (x) => String(x == null ? '' : x)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const pids = Object.keys(map);
+  const sample = pids.slice(0, 200);
+  let body = '';
+  sample.forEach(pid => {
+    const e = map[pid];
+    body += `<tr>` +
+      `<td>${pid}</td>` +
+      `<td>${escHtml(e.parentCode) || '<span style="color:var(--text-3)">—</span>'}</td>` +
+      `<td>${escHtml(e.categoryName) || '<span style="color:var(--text-3)">—</span>'}</td>` +
+      `<td>${escHtml(e.productType) || '<span style="color:var(--text-3)">—</span>'}</td>` +
+      `<td>${escHtml(e.vendorName) || '<span style="color:var(--text-3)">—</span>'}</td>` +
+      `<td>${escHtml(e.parentLaunchDate) || '<span style="color:var(--text-3)">—</span>'}</td>` +
+      `<td class="num">${fmt(e.children.length)}</td>` +
+      `</tr>`;
+  });
+  const droppedNote = (stats.standalone)
+    ? ` · <span style="color:var(--text-3)">incl. ${fmt(stats.standalone)} standalone (no parent)</span>`
+    : '';
+  el.innerHTML =
+    `<div class="master-preview-summary" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px;">` +
+      `<span><strong style="color:var(--accent)">Cleaned</strong> — <strong>${fmt(stats.parents)}</strong> parents · <strong>${fmt(stats.children)}</strong> child codes${droppedNote}</span>` +
+      `<button class="upload-btn" id="masterPreviewDownload" title="Download the full cleaned data as Excel">↓ Download full cleaned file</button>` +
+    `</div>` +
+    `<div style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin-bottom:6px;">Preview of first ${fmt(sample.length)} of ${fmt(stats.parents)} parents (Product Name is the identity code)</div>` +
+    `<div class="table-wrap" style="max-height:360px;"><table class="master-preview-table">` +
+      `<thead><tr><th>Parent ID</th><th>Product Name</th><th>Category</th><th>Product Type</th><th>Supplier</th><th>Launch Date</th><th class="num">#Children</th></tr></thead>` +
+      `<tbody>${body}</tbody></table></div>`;
+  el.style.display = '';
+  const dlBtn = document.getElementById('masterPreviewDownload');
+  if (dlBtn) dlBtn.addEventListener('click', () => downloadCleanedMaster(map));
 }
 
 document.getElementById('uploadBtnTrigger').addEventListener('click', () => {
@@ -3795,15 +4075,44 @@ document.getElementById('uploadBtnTrigger').addEventListener('click', () => {
 document.getElementById('masterUpload').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  readFileAsCSVText(file).then(text => {
-    const result = parseMasterCSV(text);
+  runWithLoader('Cleaning &amp; building from ' + file.name + '…', () =>
+  readUploadFile(file).then(({ objects, csvText }) => {
+    // Raw ERP Product Master export → clean it, preview it, then feed the existing engine.
+    if (isRawProductMaster(objects)) {
+      const { map, idIndex, stats } = transformProductMasterRaw(objects);
+      if (!stats.parents) {
+        alert('No valid parent products found after cleaning. Every row had a blank/0 or unmatched Parent Product.');
+        return;
+      }
+      // Persist the ProductId → parent-code index so the Purchase/Sales cleaners can resolve PIDs.
+      Object.keys(productIdToParentCode).forEach(k => delete productIdToParentCode[k]);
+      Object.assign(productIdToParentCode, idIndex);
+      saveProductIdIndex();
+      renderMasterPreview(stats, map);
+      // Enter real-data mode and BUILD the live dashboard from this master (+ any sales/purchase/
+      // stock already uploaded). applyMasterOverride still records parentLaunchDates/productTypes.
+      realDataMode = true;
+      realData.masterMap = map;
+      applyMasterOverride(map, file.name, {});
+      rebuildDashboardFromUploads();
+      document.getElementById('uploadStatus').innerHTML =
+        `<strong>Dashboard built from your data</strong> — <strong style="color:var(--accent)">${fmt(stats.parents)}</strong> products · <strong style="color:var(--accent)">${fmt(stats.children)}</strong> child codes. Upload Sales / Purchases / Stock to fill it in.`;
+      document.getElementById('uploadStatus').classList.add('loaded');
+      document.getElementById('masterReset').style.display = '';
+      return;
+    }
+    // Clean-schema path (unchanged) — hide any stale raw preview first.
+    const pv = document.getElementById('masterPreview');
+    if (pv) { pv.style.display = 'none'; pv.innerHTML = ''; }
+    const result = parseMasterCSV(csvText);
     if (!result || result.error) {
-      alert('Could not parse file: ' + (result ? result.error : 'unknown error') + '\n\nExpected columns: parent_id, parent_code, child_code, folder, variant (optional: vendor_name, zone)');
+      alert('Could not parse file: ' + (result ? result.error : 'unknown error') + '\n\nExpected columns: parent_id, parent_code, child_code, folder, variant (optional: vendor_name, zone)\n\nOr upload your raw Product Master export (ProductId, Product Name, Parent Product, …) to have it cleaned automatically.');
       return;
     }
     applyMasterOverride(result.map, file.name, result.zonesByFolder);
     persistDatasetToMongo();
-  }).catch(err => alert('Error: ' + (err.message || err)));
+  }).catch(err => alert('Error: ' + (err.message || err)))
+  );
   e.target.value = '';
 });
 
@@ -3814,6 +4123,8 @@ document.getElementById('masterReset').addEventListener('click', () => {
   applyCategoryOverrides(null);     // revert category changes
   applySubCategoryOverrides(null);  // revert sub-category changes
   try { localStorage.removeItem('inventoryMasterOverride'); } catch (e) {}
+  const pv = document.getElementById('masterPreview');
+  if (pv) { pv.style.display = 'none'; pv.innerHTML = ''; }
   document.getElementById('uploadStatus').textContent = 'Using synthetic mapping — upload your real master CSV to swap in';
   document.getElementById('uploadStatus').classList.remove('loaded');
   document.getElementById('masterReset').style.display = 'none';
@@ -3822,8 +4133,8 @@ document.getElementById('masterReset').addEventListener('click', () => {
   rerender();
 });
 
-// Restore upload UI state if mapping was saved
-if (masterOverride) {
+// Restore upload UI state if a DEMO-mode mapping was saved (real-data mode rebuilds from D instead).
+if (masterOverride && !(D && D.__real)) {
   // Re-apply vendor + category + sub-category overrides from saved mapping
   applyVendorOverrides(masterOverride);
   applyCategoryOverrides(masterOverride);
@@ -3992,11 +4303,126 @@ function parseStockCSV(text) {
   return { byCode, count: rows, skipped };
 }
 
+// ===== Raw "Stock Master" export → cleaned per-parent on-hand =====
+// Many rows per product (per godown/rack). Only ProductID, Name, Stock matter. A parent and its
+// children are the SAME physical product, so we resolve each row's ProductID → parent code and
+// SUM the stock per parent group (folding all children + all godown rows into one on-hand).
+function isRawStock(objects) {
+  if (!objects || !objects.length) return false;
+  const keys = Object.keys(objects[0]).map(k => String(k).trim().toLowerCase());
+  return keys.includes('productid') && keys.includes('stock') && keys.includes('name');
+}
+function transformStockRaw(objects) {
+  const empty = { stockByCode: {}, stats: { parents: 0, totalStock: 0, rows: 0, droppedUnresolved: 0 }, aggregates: {}, sampleTx: [] };
+  if (!objects || !objects.length) return empty;
+  const sk = Object.keys(objects[0]);
+  const findKey = (t) => sk.find(k => String(k).trim().toLowerCase() === t) || null;
+  const kPid = findKey('productid'), kName = findKey('name'), kStock = findKey('stock');
+  if (!kPid || !kStock) return empty;
+  const str = (v) => (v == null ? '' : String(v).trim());
+  const numInt = (v) => { const n = parseInt(v, 10); return isNaN(n) ? null : n; };
+
+  const stockByCode = {};   // UPPER(parentCode) → { k }
+  const aggregates = {};    // UPPER(parentCode) → { parentCode, k, rows }
+  const sampleTx = [];
+  let totalStock = 0, rows = 0, droppedUnresolved = 0;
+
+  objects.forEach(r => {
+    const pid = numInt(r[kPid]);
+    const parentCode = (pid != null) ? productIdToParentCode[pid] : null;
+    if (!parentCode) { droppedUnresolved++; return; }
+    const qty = numInt(r[kStock]) || 0;
+    const codeKey = parentCode.toUpperCase().trim();
+    if (!stockByCode[codeKey]) stockByCode[codeKey] = { k: 0 };
+    stockByCode[codeKey].k += qty;
+    let a = aggregates[codeKey];
+    if (!a) a = aggregates[codeKey] = { parentCode, k: 0, rows: 0 };
+    a.k += qty; a.rows++;
+    if (sampleTx.length < 200) sampleTx.push({ parent: parentCode, name: str(r[kName]), qty, pid });
+    totalStock += qty; rows++;
+  });
+
+  return { stockByCode, stats: { parents: Object.keys(stockByCode).length, totalStock, rows, droppedUnresolved }, aggregates, sampleTx };
+}
+function downloadCleanedStock(stockByCode) {
+  const rows = [['parent_code', 'on_hand']];
+  Object.keys(stockByCode).forEach(code => rows.push([code, stockByCode[code].k]));
+  downloadXlsx('Cleaned_Stock.xlsx', 'Cleaned Stock', rows);
+}
+function renderStockPreview(stats, aggregates, sampleTx, stockByCode) {
+  const el = document.getElementById('stockPreview');
+  if (!el) return;
+  const escHtml = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const dash = '<span style="color:var(--text-3)">—</span>';
+  const aggKeys = Object.keys(aggregates).slice(0, 200);
+  let aggBody = '';
+  aggKeys.forEach(k => { const a = aggregates[k]; aggBody += `<tr><td>${escHtml(a.parentCode)}</td><td class="num">${fmt(a.k)}</td><td class="num">${fmt(a.rows)}</td></tr>`; });
+  let txBody = '';
+  sampleTx.forEach(t => { txBody += `<tr><td>${escHtml(t.parent)}</td><td>${escHtml(t.name) || dash}</td><td class="num">${fmt(t.qty)}</td><td class="num">${t.pid}</td></tr>`; });
+  const totalParents = Object.keys(aggregates).length;
+  el.innerHTML =
+    `<div class="master-preview-summary" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px;">` +
+      `<span><strong style="color:var(--accent)">Cleaned stock</strong> — <strong>${fmt(stats.parents)}</strong> parents · <strong>${fmt(stats.totalStock)}</strong> on-hand (summed parent+children)` +
+      `<span style="color:var(--text-3)"> · ${fmt(stats.rows)} rows · dropped ${fmt(stats.droppedUnresolved)} unresolved</span></span>` +
+      `<button class="upload-btn" id="stockPreviewDownload" title="Download the cleaned parent_code, on_hand file">↓ Download full cleaned file</button>` +
+    `</div>` +
+    `<div style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin-bottom:6px;">Per-parent on-hand (first ${fmt(aggKeys.length)} of ${fmt(totalParents)} parents) — stock summed across the parent and all its child codes</div>` +
+    `<div class="table-wrap" style="max-height:280px;"><table class="master-preview-table">` +
+      `<thead><tr><th>Parent</th><th class="num">On-hand</th><th class="num">#Stock rows</th></tr></thead><tbody>${aggBody}</tbody></table></div>` +
+    `<div style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin:10px 0 6px;">Sample rows (first ${fmt(sampleTx.length)} — each mapped to its parent)</div>` +
+    `<div class="table-wrap" style="max-height:280px;"><table class="master-preview-table">` +
+      `<thead><tr><th>Parent</th><th>Name</th><th class="num">Stock</th><th class="num">ProductID</th></tr></thead><tbody>${txBody}</tbody></table></div>`;
+  el.style.display = '';
+  const dl = document.getElementById('stockPreviewDownload');
+  if (dl) dl.addEventListener('click', () => downloadCleanedStock(stockByCode));
+}
+
 function handleStockFile(file) {
   if (!file) return;
-  readFileAsCSVText(file).then(text => {
+  // Raw Stock Master (.xlsx with ProductID/Name/Stock) needs object rows; the clean template is CSV.
+  runWithLoader('Cleaning stock — ' + file.name + '…', () =>
+  readUploadFile(file).then(({ objects, csvText }) => {
+    if (isRawStock(objects)) {
+      if (!Object.keys(productIdToParentCode).length) {
+        setStockStatus('<span style="color:var(--red)">Upload &amp; clean the Product Master first (needed to map ProductID → parent)</span>', 'err');
+        return;
+      }
+      const { stockByCode, stats, aggregates, sampleTx } = transformStockRaw(objects);
+      if (!stats.parents) { setStockStatus('<span style="color:var(--red)">No stock rows resolved to a parent</span>', 'err'); return; }
+      // Upsert into realData (set on-hand k; keep any it/po) and rebuild the live dashboard.
+      Object.keys(stockByCode).forEach(code => {
+        realData.stockByCode[code] = Object.assign({}, realData.stockByCode[code], { k: stockByCode[code].k });
+      });
+      renderStockPreview(stats, aggregates, sampleTx, stockByCode);
+      if (realDataMode) {
+        rebuildDashboardFromUploads();
+        setStockStatus(`<strong>Stock cleaned &amp; dashboard rebuilt</strong> from <strong style="color:var(--accent)">${file.name}</strong> — <strong>${fmt(stats.parents)}</strong> parents · <strong>${fmt(stats.totalStock)}</strong> on-hand`, 'ok');
+      } else {
+        setStockStatus(`<strong>Stock cleaned</strong> — upload &amp; build the Master first to see it on the dashboard`, 'ok');
+      }
+      document.getElementById('stockUploadDetail').innerHTML = stats.droppedUnresolved > 0 ? `${fmt(stats.droppedUnresolved)} row(s) with unresolved ProductID` : '';
+      document.getElementById('stockReset').style.display = '';
+      return;
+    }
+    const pv = document.getElementById('stockPreview');
+    if (pv) { pv.style.display = 'none'; pv.innerHTML = ''; }
+    const text = csvText;
     const parsed = parseStockCSV(text);
     stockOverride = { byCode: parsed.byCode, count: parsed.count, uploadedAt: new Date().toISOString(), fileName: file.name };
+    // Real-data mode: fold stock into realData (upsert by parent code) and rebuild the dashboard.
+    if (realDataMode) {
+      Object.keys(parsed.byCode).forEach(code => {
+        const src = parsed.byCode[code];
+        realData.stockByCode[code] = Object.assign({}, realData.stockByCode[code], {
+          k: src.k, it: src.it, po: src.po,
+        });
+      });
+      rebuildDashboardFromUploads();
+      setStockStatus(`<strong>Stock loaded &amp; dashboard rebuilt</strong> from <strong style="color:var(--accent)">${file.name}</strong> — <strong>${fmt(parsed.count)}</strong> rows`, 'ok');
+      document.getElementById('stockUploadDetail').innerHTML = parsed.skipped > 0 ? `${fmt(parsed.skipped)} row(s) skipped (blank or no values)` : '';
+      document.getElementById('stockReset').style.display = '';
+      return;
+    }
     const { matched, unmatched, discToggled } = applyStockOverride(stockOverride);
     saveStockOverride();
     setStockStatus(`<strong>Stock data loaded</strong> from <strong style="color:var(--accent)">${file.name}</strong> — <strong>${fmt(parsed.count)}</strong> rows parsed, <strong style="color:var(--green)">${fmt(matched)}</strong> matched to products`, 'ok');
@@ -4010,7 +4436,8 @@ function handleStockFile(file) {
   }).catch(err => {
     setStockStatus('Error: ' + (err.message || 'failed to parse file'), 'err');
     document.getElementById('stockUploadDetail').textContent = '';
-  });
+  })
+  );
 }
 
 // Wire up upload + reset
@@ -4288,6 +4715,10 @@ function clearHistoryOverride() {
   if (sEl) sEl.innerHTML = '<strong>Sales</strong> — no file loaded';
   const pEl = document.getElementById('purchUploadStatus');
   if (pEl) pEl.innerHTML = '<strong>Purchases</strong> — no file loaded';
+  ['salesPreview', 'purchasePreview'].forEach(id => {
+    const pv = document.getElementById(id);
+    if (pv) { pv.style.display = 'none'; pv.innerHTML = ''; }
+  });
   rerender();
 }
 
@@ -4318,6 +4749,400 @@ function handleHistFile(file) {
   });
 }
 
+// ===== Raw "Sales" / "Purchase" export → cleaned per-parent monthly quantities =====
+// Both ERP exports share the same shape (Date, Product, Product Code, Qty, Company Name, PID),
+// so one set of helpers serves both — only the target array ('s' sales / 'p' purchases) differs.
+// Detected by column names (the clean template has none of these).
+function isRawHistory(objects) {
+  if (!objects || !objects.length) return false;
+  const keys = Object.keys(objects[0]).map(k => String(k).trim().toLowerCase());
+  return keys.includes('pid') && keys.includes('qty') && keys.includes('product');
+}
+// Parse the ERP date "dd-mm-yyyy | hh:mm AM/PM" → "yyyy-mm" (or '' if unparseable).
+function historyMonthKey(raw) {
+  if (!raw) return '';
+  const datePart = String(raw).split('|')[0].trim();            // "30-03-2025"
+  const m = datePart.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})/);
+  if (!m) return '';
+  let yy = m[3];
+  if (yy.length === 2) yy = '20' + yy;
+  return `${yy}-${String(m[2]).padStart(2, '0')}`;              // "2025-03"
+}
+// Transform raw sales/purchase rows → { byCode, monthByCode, stats, aggregates, sampleTx }.
+// Resolves each line's PID (=ProductId) → parent code via productIdToParentCode, then SUMS Qty
+// per parent × month. `byCode` is the 24-slot array aligned to the CURRENT D.months window (used
+// by the preview + clean-CSV feed). `monthByCode` is the FULL month-keyed map (every 'yyyy-mm',
+// no window filter) that the real-data rebuild uses to shift the window to the latest data.
+function transformHistoryRaw(objects, key) {
+  const empty = { byCode: {}, monthByCode: {}, stats: { resolvedRows: 0, parents: 0, totalQty: 0, droppedUnresolved: 0, droppedOutOfWindow: 0 }, aggregates: {}, sampleTx: [] };
+  if (!objects || !objects.length) return empty;
+  const sk = Object.keys(objects[0]);
+  const findKey = (t) => sk.find(k => String(k).trim().toLowerCase() === t) || null;
+  const kDate = findKey('date'), kProduct = findKey('product');
+  const kQty = findKey('qty'), kCompany = findKey('company name'), kPid = findKey('pid');
+  if (!kPid || !kQty) return empty;
+  const str = (v) => (v == null ? '' : String(v).trim());
+  const numInt = (v) => { const n = parseInt(v, 10); return isNaN(n) ? null : n; };
+
+  const byCode = {};
+  const monthByCode = {};  // UPPER(parentCode) → { 'yyyy-mm': summedQty }  (all months)
+  const aggregates = {};   // UPPER(parentCode) → { parentCode, totalQty, txCount, months:Set, parties:Set }
+  const sampleTx = [];
+  let resolvedRows = 0, totalQty = 0, droppedUnresolved = 0, droppedOutOfWindow = 0;
+
+  objects.forEach(r => {
+    const pid = numInt(r[kPid]);
+    const parentCode = (pid != null) ? productIdToParentCode[pid] : null;
+    if (!parentCode) { droppedUnresolved++; return; }
+    const ym = historyMonthKey(r[kDate]);
+    if (!ym) { droppedOutOfWindow++; return; }   // unparseable date
+    const qty = numInt(r[kQty]) || 0;
+    const codeKey = parentCode.toUpperCase().trim();
+    // Full month-keyed map (retains ALL months for the window-shifting rebuild)
+    if (!monthByCode[codeKey]) monthByCode[codeKey] = {};
+    monthByCode[codeKey][ym] = (monthByCode[codeKey][ym] || 0) + qty;
+    // 24-slot fixed-window aggregate (for preview + clean-CSV feed)
+    const mIdx = lookupMonthIdx(ym);
+    if (mIdx === -1) { droppedOutOfWindow++; return; }
+    if (!byCode[codeKey]) byCode[codeKey] = { s: new Array(24).fill(null), p: new Array(24).fill(null) };
+    byCode[codeKey][key][mIdx] = (byCode[codeKey][key][mIdx] || 0) + qty;
+    let a = aggregates[codeKey];
+    if (!a) a = aggregates[codeKey] = { parentCode, totalQty: 0, txCount: 0, months: new Set(), parties: new Set() };
+    a.totalQty += qty; a.txCount++; a.months.add(mIdx);
+    const party = str(r[kCompany]); if (party) a.parties.add(party);
+    if (sampleTx.length < 200) {
+      sampleTx.push({ date: str(r[kDate]).split('|')[0].trim(), parent: parentCode, product: str(r[kProduct]), qty, party, pid });
+    }
+    resolvedRows++; totalQty += qty;
+  });
+
+  return {
+    byCode, monthByCode,
+    stats: { resolvedRows, parents: Object.keys(byCode).length, totalQty, droppedUnresolved, droppedOutOfWindow },
+    aggregates, sampleTx,
+  };
+}
+function downloadCleanedHistory(byCode, key, valueLabel) {
+  const cap = valueLabel === 'sales' ? 'Sales' : 'Purchases';
+  const headers = ['parent_code', 'month', valueLabel];
+  const rows = [headers];
+  Object.keys(byCode).forEach(code => {
+    const arr = byCode[code][key];
+    for (let i = 0; i < 24; i++) if (arr[i] != null) rows.push([code, D.months[i], arr[i]]);
+  });
+  downloadXlsx(`Cleaned_${cap}.xlsx`, `Cleaned ${cap}`, rows);
+}
+// opts = { key:'s'|'p', valueType:'sales'|'purchases', containerId, entity:'Customer'|'Vendor' }
+function renderHistoryPreview(stats, aggregates, sampleTx, byCode, opts) {
+  const el = document.getElementById(opts.containerId);
+  if (!el) return;
+  const escHtml = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const dash = '<span style="color:var(--text-3)">—</span>';
+  const label = opts.valueType === 'sales' ? 'sales' : 'purchases';
+  const countHdr = opts.valueType === 'sales' ? '#Sales' : '#Purchases';
+  const dlId = opts.containerId + 'Download';
+  const aggKeys = Object.keys(aggregates).slice(0, 200);
+  let aggBody = '';
+  aggKeys.forEach(k => {
+    const a = aggregates[k];
+    aggBody += `<tr><td>${escHtml(a.parentCode)}</td><td class="num">${fmt(a.totalQty)}</td><td class="num">${fmt(a.txCount)}</td><td class="num">${fmt(a.months.size)}</td><td>${escHtml([...a.parties].slice(0, 2).join(', ')) || dash}</td></tr>`;
+  });
+  let txBody = '';
+  sampleTx.forEach(t => {
+    txBody += `<tr><td>${escHtml(t.date)}</td><td>${escHtml(t.parent)}</td><td>${escHtml(t.product) || dash}</td><td class="num">${fmt(t.qty)}</td><td>${escHtml(t.party) || dash}</td><td class="num">${t.pid}</td></tr>`;
+  });
+  const totalParents = Object.keys(aggregates).length;
+  el.innerHTML =
+    `<div class="master-preview-summary" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px;">` +
+      `<span><strong style="color:var(--accent)">Cleaned ${label}</strong> — <strong>${fmt(stats.parents)}</strong> parents · <strong>${fmt(stats.resolvedRows)}</strong> in-window lines · <strong>${fmt(stats.totalQty)}</strong> total qty` +
+      `<span style="color:var(--text-3)"> · dropped ${fmt(stats.droppedOutOfWindow)} out-of-window, ${fmt(stats.droppedUnresolved)} unresolved PID</span></span>` +
+      `<button class="upload-btn" id="${dlId}" title="Download the cleaned parent_code, month, ${label} file">↓ Download full cleaned file</button>` +
+    `</div>` +
+    `<div style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin-bottom:6px;">Per-parent aggregate (first ${fmt(aggKeys.length)} of ${fmt(totalParents)} parents) — qty summed across all ${label} lines</div>` +
+    `<div class="table-wrap" style="max-height:280px;"><table class="master-preview-table">` +
+      `<thead><tr><th>Parent</th><th class="num">Total Qty</th><th class="num">${countHdr}</th><th class="num">#Months</th><th>${opts.entity}(s)</th></tr></thead><tbody>${aggBody}</tbody></table></div>` +
+    `<div style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin:10px 0 6px;">Transaction sample (first ${fmt(sampleTx.length)} cleaned lines — each mapped to its parent)</div>` +
+    `<div class="table-wrap" style="max-height:280px;"><table class="master-preview-table">` +
+      `<thead><tr><th>Date</th><th>Parent</th><th>Product</th><th class="num">Qty</th><th>${opts.entity}</th><th class="num">PID</th></tr></thead><tbody>${txBody}</tbody></table></div>`;
+  el.style.display = '';
+  const dl = document.getElementById(dlId);
+  if (dl) dl.addEventListener('click', () => downloadCleanedHistory(byCode, opts.key, label));
+}
+
+// Merge a { code: {s,p} } map into the shared historyOverride, filling only the `key` array
+// (`s` for sales, `p` for purchases) so sales and purchases never clobber each other.
+function mergeHistoryByCode(srcByCode, key, fileName, count) {
+  if (!historyOverride || !historyOverride.byCode) {
+    historyOverride = { byCode: {}, count: 0, parentCount: 0, fileName: '' };
+  }
+  Object.keys(srcByCode).forEach(code => {
+    if (!historyOverride.byCode[code]) {
+      historyOverride.byCode[code] = { s: new Array(24).fill(null), p: new Array(24).fill(null) };
+    }
+    const src = srcByCode[code][key];
+    for (let i = 0; i < 24; i++) if (src[i] != null) historyOverride.byCode[code][key][i] = src[i];
+  });
+  historyOverride.count = (historyOverride.count || 0) + (count || 0);
+  historyOverride.parentCount = Object.keys(historyOverride.byCode).length;
+  historyOverride.uploadedAt = new Date().toISOString();
+  historyOverride.fileName = fileName;
+}
+
+// ============================================================================
+// Build the LIVE dashboard from the user's raw uploads (real-data mode).
+// Constructs the whole dataset `D` (products + lookups + kpi/agg/folderSummary +
+// a window shifted to the latest data) and refreshes every view in place.
+// ============================================================================
+const _MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+// "2026-07" → 24 month labels ("Aug-24" … "Jul-26") ending at that month.
+function build24Window(endYm) {
+  let [y, m] = String(endYm).split('-').map(n => parseInt(n, 10));
+  const labels = [];
+  for (let i = 23; i >= 0; i--) {
+    let mm = m - i, yy = y;
+    while (mm <= 0) { mm += 12; yy -= 1; }
+    labels.push(`${_MONTH_ABBR[mm - 1]}-${String(yy).slice(-2)}`);
+  }
+  return labels;
+}
+// window labels → { 'yyyy-mm': slotIndex }
+function windowIndexMap(labels) {
+  const map = {};
+  labels.forEach((lbl, i) => {
+    const [mon, yy] = lbl.split('-');
+    const mm = _MONTH_ABBR.indexOf(mon) + 1;
+    if (mm > 0) map[`20${yy}-${String(mm).padStart(2, '0')}`] = i;
+  });
+  return map;
+}
+// Newest 'yyyy-mm' present across sales+purchase; fallback keeps a valid window.
+function computeDataWindowEnd() {
+  let maxYm = '';
+  const scan = (store) => Object.keys(store).forEach(c => Object.keys(store[c]).forEach(ym => { if (ym > maxYm) maxYm = ym; }));
+  scan(realData.salesByMonth); scan(realData.purchByMonth);
+  return maxYm || '2026-04';
+}
+// ---- Classification helpers (standard inventory heuristics matching D's label sets) ----
+function monthsSinceLastSale(s) {
+  for (let i = s.length - 1, k = 0; i >= 0; i--, k++) if ((+s[i] || 0) > 0) return k;
+  return 13; // never sold within the window
+}
+function productAgeMonths(launchStr, anchorYm) {
+  if (!launchStr) return 24;
+  const m = String(launchStr).match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})/);
+  if (!m) return 24;
+  let ly = m[3]; if (ly.length === 2) ly = '20' + ly;
+  const lym = parseInt(ly, 10) * 12 + parseInt(m[2], 10);
+  const [ay, am] = anchorYm.split('-').map(n => parseInt(n, 10));
+  return Math.max(0, Math.min(24, ay * 12 + am - lym));
+}
+function turnoverRatio(p) {
+  const stock = p.av || 0;
+  if (stock <= 0) return 99;                    // ∞ sentinel (must be a number)
+  return Math.min(99, Math.round((p.a || 0) / stock * 100) / 100);
+}
+function statusIndexFor(p) {
+  const S = (name) => { const i = D.statusCodes.indexOf(name); return i >= 0 ? i : 0; };
+  const hasStock = (p.av || 0) > 0;
+  const hasSales = (p.a || 0) > 0 || (p.m || 0) > 0;
+  if (!hasStock && !hasSales) return S('Inactive');
+  if (!hasStock) return S('Critical');          // demand but nothing on hand
+  if (!hasSales) return S('Dead Stock');         // stock but no sales
+  const ad = p.ad;
+  if (ad < 15) return S('Critical');
+  if (ad < 30) return S('Low Stock');
+  if (ad <= 90) return S('Healthy');
+  if (ad <= 180) return S('Adequate');
+  return S('Overstocked');
+}
+function moverIndexFor(p) {
+  const Mv = (name) => { const i = D.moverCodes.indexOf(name); return i >= 0 ? i : 0; };
+  if ((p.av || 0) <= 0 && (p.a || 0) <= 0) return Mv('No Stock');
+  const ms = p.ms;
+  if (ms >= 12) return Mv('Non-Moving (12m+)');
+  if (ms >= 6) return Mv('Slow (6-12m)');
+  if (ms >= 3) return Mv('Sluggish (3-6m)');
+  return Mv('Active');
+}
+// Pareto ABC on annual sales units: cumulative ≤80% → A, ≤95% → B, else C.
+function assignABC(products) {
+  const sorted = products.slice().sort((a, b) => (b.a || 0) - (a.a || 0));
+  const total = sorted.reduce((x, p) => x + (p.a || 0), 0);
+  let cum = 0;
+  sorted.forEach(p => {
+    if (total <= 0 || (p.a || 0) <= 0) { p.b = 2; return; }
+    cum += (p.a || 0);
+    const share = cum / total;
+    p.b = share <= 0.80 ? 0 : share <= 0.95 ? 1 : 2;
+  });
+}
+// Rebuild D.aggP / D.aggS / D.kpi / D.folderSummary from the freshly built products.
+function rebuildAggregates() {
+  const products = D.products;
+  const aggP = new Array(24).fill(0), aggS = new Array(24).fill(0);
+  products.forEach(p => { for (let i = 0; i < 24; i++) { aggP[i] += (+p.p[i] || 0); aggS[i] += (+p.s[i] || 0); } });
+  D.aggP = aggP; D.aggS = aggS;
+
+  const critIdx = D.statusCodes.indexOf('Critical');
+  let totalChildren = 0, totalStock = 0, inTransit = 0, pending = 0, annualSales = 0;
+  let classACount = 0, classBCount = 0, classCCount = 0, classASales = 0, criticalCount = 0, slowCount = 0, nonMovingUnits = 0, bulkAnomalyCount = 0;
+  products.forEach(p => {
+    totalChildren += (p.ch ? p.ch.length : 0);
+    totalStock += (+p.k || 0); inTransit += (+p.it || 0); pending += (+p.po || 0);
+    annualSales += (+p.a || 0);
+    if (p.b === 0) { classACount++; classASales += (+p.a || 0); } else if (p.b === 1) classBCount++; else classCCount++;
+    if (p.st === critIdx) criticalCount++;
+    const mv = D.moverCodes[p.mv] || '';
+    if (mv.startsWith('Slow') || mv.startsWith('Non-Moving')) { slowCount++; nonMovingUnits += (+p.k || 0); }
+    bulkAnomalyCount += (p.ba ? p.ba.length : 0);
+  });
+  D.kpi = {
+    totalProducts: products.length, totalChildren,
+    totalFolders: D.folders.length, totalCategories: D.cats.length,
+    annualSales, totalStock, inTransitTotal: inTransit, pendingTotal: pending,
+    classACount, classBCount, classCCount, classASales,
+    netReorderQty: 0, netReorderProducts: 0, reorderSavedByPipeline: 0,
+    criticalCount, criticalImprovedCount: 0,
+    bulkAnomalyCount, slowMoverCount: slowCount, nonMovingUnits,
+  };
+
+  const byFolder = {};
+  products.forEach(p => {
+    const f = D.folders[p.fl] || '(uncategorized)';
+    if (!byFolder[f]) byFolder[f] = { Folder: f, parents: 0, children: 0, sales: 0, stock: 0, folder_age: 0, _ageSum: 0, folder_avg_age: 0, new_count: 0, young_count: 0 };
+    const g = byFolder[f];
+    g.parents++; g.children += (p.ch ? p.ch.length : 0); g.sales += (+p.a || 0); g.stock += (+p.k || 0);
+    g.folder_age = Math.max(g.folder_age, p.pa || 0); g._ageSum += (p.pa || 0);
+    if ((p.pa || 0) <= 3) g.new_count++;
+    if ((p.pa || 0) <= 6) g.young_count++;
+  });
+  D.folderSummary = Object.values(byFolder).map(g => { g.folder_avg_age = g.parents ? Math.round(g._ageSum / g.parents) : 0; delete g._ageSum; return g; });
+}
+// The orchestrator — called after each raw upload once a real Master is present.
+function rebuildDashboardFromUploads() {
+  if (!realData.masterMap) return;
+  const map = realData.masterMap;
+
+  // 1) Window from the latest data
+  const endYm = computeDataWindowEnd();
+  const months = build24Window(endYm);
+  const ymIdx = windowIndexMap(months);
+  D.months = months;
+
+  // 2) Lookups: vendors = Suppliers, cats = folders = Categories, subCats empty
+  const vendors = [], vendorIdx = {}, cats = [], catIdx = {};
+  const ensureVendor = (name) => {
+    const clean = (name || '').trim();
+    const keyU = clean.toUpperCase() || '__NONE__';
+    if (vendorIdx[keyU] == null) {
+      vendorIdx[keyU] = vendors.length;
+      vendors.push(clean ? { code: 'V' + String(vendors.length + 1).padStart(3, '0'), name: clean, city: '', skus: 0 }
+                         : { code: '—', name: '(no supplier)', city: '', skus: 0 });
+    }
+    return vendorIdx[keyU];
+  };
+  const ensureCat = (name) => {
+    const clean = (name || '').trim() || '(uncategorized)';
+    const keyU = clean.toUpperCase();
+    if (catIdx[keyU] == null) { catIdx[keyU] = cats.length; cats.push(clean); }
+    return catIdx[keyU];
+  };
+
+  // 3) Products — one per parent
+  const products = [];
+  const okPriority = Math.max(0, D.priorityCodes.indexOf('OK'));
+  Object.keys(map).forEach(pidKey => {
+    const e = map[pidKey];
+    const code = (e.parentCode || '').trim();
+    if (!code) return;
+    const codeU = code.toUpperCase();
+    const v = ensureVendor(e.vendorName);
+    const c = ensureCat(e.categoryName);
+    const s = new Array(24).fill(0), pr = new Array(24).fill(0);
+    const sm = realData.salesByMonth[codeU]; if (sm) Object.keys(sm).forEach(ym => { const i = ymIdx[ym]; if (i != null) s[i] += sm[ym]; });
+    const pm = realData.purchByMonth[codeU]; if (pm) Object.keys(pm).forEach(ym => { const i = ymIdx[ym]; if (i != null) pr[i] += pm[ym]; });
+    const st = realData.stockByCode[codeU] || {};
+    // Uploaded stock file wins; otherwise fall back to the Master's parent-level Stock column.
+    const k = (st.k != null ? +st.k : (+e.stock || 0)), it = +st.it || 0, po = +st.po || 0;
+    const ch = (e.children || []).map(ci => [String(ci.code || ''), null, 0]);
+    vendors[v].skus += 1;
+    products.push({
+      i: parseInt(pidKey, 10), n: code, v, c, fl: c, sc: undefined,
+      s, p: pr, ch, ba: [],
+      k, it, po, av: k + it, tp: k + it + po,
+      a: 0, m: 0, ad: 999, d: 999, f: 0, nr: 0, r: 0, x: 0, t: 99,
+      b: 2, st: 0, mv: 0, ms: 13, pr: okPriority, ps: 0, pa: 24, fa: 24,
+    });
+  });
+
+  D.cats = cats; D.folders = cats; D.vendors = vendors; D.subCats = [];
+  D.products = products;
+
+  // 4) Derived + classification
+  products.forEach(p => {
+    recomputeDerivedStock(p);   // av, ad
+    recomputeSalesDerived(p);   // a, m, ad
+    p.ms = monthsSinceLastSale(p.s);
+    p.pa = productAgeMonths(parentLaunchDates[(p.n || '').toUpperCase().trim()], endYm);
+    p.fa = p.pa;
+    p.t = turnoverRatio(p);
+    p.st = statusIndexFor(p);
+    p.mv = moverIndexFor(p);
+    p.d = p.ad; p.f = Math.round(p.m || 0); p.ps = p.st;
+  });
+  assignABC(products);
+
+  // 5) Aggregates
+  rebuildAggregates();
+
+  // 6) Refresh every view in place
+  realDataMode = true;
+  D.__real = true;   // persisted flag → on reload we skip the demo dummy-vendor step & rehydrate
+  const _hw = document.getElementById('histWindowLabel');
+  if (_hw) _hw.textContent = `${D.months[0]} → ${D.months[D.months.length - 1]}`;
+  if (typeof precomputeDemandMeta === 'function') precomputeDemandMeta();
+  renderHeaderAndCharts();
+  if (typeof refreshFilterDatalists === 'function') refreshFilterDatalists();
+  if (typeof renderVendors === 'function') renderVendors();
+  if (typeof renderZoneBrowser === 'function') renderZoneBrowser();
+  if (typeof renderFolderView === 'function') renderFolderView();
+  rerender();
+  persistDatasetToMongo();
+}
+
+// On reload, the persisted `D` already holds the real catalog but the in-memory `realData` store
+// is empty — reconstruct it from `D` so further incremental uploads can rebuild correctly.
+function rehydrateRealDataFromD() {
+  const months = D.months || [];
+  const ymOf = (i) => { const [mon, yy] = String(months[i] || '').split('-'); const mm = _MONTH_ABBR.indexOf(mon) + 1; return mm > 0 ? `20${yy}-${String(mm).padStart(2, '0')}` : null; };
+  const map = {}, salesByMonth = {}, purchByMonth = {}, stockByCode = {};
+  (D.products || []).forEach(p => {
+    const codeU = (p.n || '').toUpperCase().trim();
+    map[p.i] = {
+      parentCode: p.n,
+      vendorName: (D.vendors[p.v] || {}).name || '',
+      categoryName: D.cats[p.c] || '',
+      productType: parentProductTypes[codeU] || '',
+      parentLaunchDate: parentLaunchDates[codeU] || '',
+      stock: p.k || 0,
+      children: (p.ch || []).map(c => ({ code: c[0], launchDate: '' })),
+    };
+    stockByCode[codeU] = { k: p.k || 0, it: p.it || 0, po: p.po || 0 };
+    for (let i = 0; i < 24; i++) {
+      const ym = ymOf(i); if (!ym) continue;
+      if (p.s[i]) (salesByMonth[codeU] || (salesByMonth[codeU] = {}))[ym] = p.s[i];
+      if (p.p[i]) (purchByMonth[codeU] || (purchByMonth[codeU] = {}))[ym] = p.p[i];
+    }
+  });
+  realData.masterMap = map;
+  realData.salesByMonth = salesByMonth;
+  realData.purchByMonth = purchByMonth;
+  realData.stockByCode = stockByCode;
+  // Also set the global masterOverride so getProductChildren() shows real child codes (this map
+  // is what we chose NOT to persist separately — it's rebuilt here from the cleaned catalog).
+  masterOverride = map;
+}
+
 // Upload a SALES-only or PURCHASES-only file. Each merges into the shared
 // historyOverride: a sales upload fills the `s` array, a purchases upload fills
 // the `p` array, and neither clobbers the other — so you can upload them
@@ -4329,22 +5154,52 @@ function handleHistFileTyped(file, valueType) {
   const key = isPurch ? 'p' : 's';
   const subStatusId = isPurch ? 'purchUploadStatus' : 'salesUploadStatus';
   const subStatus = document.getElementById(subStatusId);
-  readFileAsCSVText(file).then(text => {
-    const parsed = parseHistoryCSV(text, valueType);
-    if (!historyOverride || !historyOverride.byCode) {
-      historyOverride = { byCode: {}, count: 0, parentCount: 0, fileName: '' };
-    }
-    Object.keys(parsed.byCode).forEach(code => {
-      if (!historyOverride.byCode[code]) {
-        historyOverride.byCode[code] = { s: new Array(24).fill(null), p: new Array(24).fill(null) };
+  runWithLoader('Cleaning ' + label + ' — ' + file.name + '…', () =>
+  readUploadFile(file).then(({ objects, csvText }) => {
+    // ===== Raw ERP Sales/Purchase export → clean + preview + feed (both boxes) =====
+    if (isRawHistory(objects)) {
+      if (!Object.keys(productIdToParentCode).length) {
+        if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--red)">Upload &amp; clean the Product Master first (needed to map PID → parent)</span>`;
+        return;
       }
-      const src = parsed.byCode[code][key];
-      for (let i = 0; i < 24; i++) if (src[i] != null) historyOverride.byCode[code][key][i] = src[i];
-    });
-    historyOverride.count = (historyOverride.count || 0) + parsed.count;
-    historyOverride.parentCount = Object.keys(historyOverride.byCode).length;
-    historyOverride.uploadedAt = new Date().toISOString();
-    historyOverride.fileName = file.name;
+      const { byCode, monthByCode, stats, aggregates, sampleTx } = transformHistoryRaw(objects, key);
+      if (!stats.parents && !Object.keys(monthByCode).length) {
+        if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--red)">No ${label.toLowerCase()} lines resolved to a parent</span>`;
+        return;
+      }
+      renderHistoryPreview(stats, aggregates, sampleTx, byCode, {
+        key, valueType, containerId: isPurch ? 'purchasePreview' : 'salesPreview', entity: isPurch ? 'Vendor' : 'Customer',
+      });
+      if (realDataMode) {
+        // Keep the full month map (upsert: re-uploaded months replace, new months merge) and
+        // rebuild the live dashboard so the window shifts to the latest data.
+        mergeMonthMaps(isPurch ? realData.purchByMonth : realData.salesByMonth, monthByCode);
+        rebuildDashboardFromUploads();
+        const lines = Object.values(monthByCode).reduce((s, m) => s + Object.keys(m).length, 0);
+        if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--green)">${fmt(stats.resolvedRows)}</span> lines · ${fmt(Object.keys(monthByCode).length)} parents · <span style="color:var(--accent)">${file.name}</span>`;
+        setHistStatus(`<strong>${label} loaded &amp; dashboard rebuilt</strong> — window now ${D.months[0]} → ${D.months[D.months.length - 1]}`, 'ok');
+        document.getElementById('histUploadDetail').innerHTML = `${fmt(stats.droppedUnresolved)} line(s) with unresolved PID`;
+        document.getElementById('histReset').style.display = '';
+        return;
+      }
+      // Demo-overlay mode (no real Master built yet): feed the existing 24-month engine.
+      mergeHistoryByCode(byCode, key, file.name, stats.resolvedRows);
+      const { matched, unmatched } = applyHistoryOverride(historyOverride);
+      saveHistoryOverride();
+      if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--green)">${fmt(stats.resolvedRows)}</span> lines · ${fmt(stats.parents)} parents · <span style="color:var(--accent)">${file.name}</span>`;
+      setHistStatus(`<strong>${label} cleaned &amp; loaded</strong> — <strong>${fmt(stats.parents)}</strong> parents · <strong style="color:var(--green)">${fmt(matched)}</strong> matched to products`, 'ok');
+      const notes = [`${fmt(stats.droppedOutOfWindow)} line(s) out of the 24-month window`, `${fmt(stats.droppedUnresolved)} line(s) with unresolved PID`];
+      if (unmatched > 0) notes.push(`${fmt(unmatched)} products kept their original data (no match)`);
+      document.getElementById('histUploadDetail').innerHTML = notes.join(' · ');
+      document.getElementById('histReset').style.display = '';
+      rerender();
+      persistDatasetToMongo();
+      return;
+    }
+    // ===== Clean-schema path (parent_code, month, sales|purchases) — unchanged =====
+    { const pv = document.getElementById(isPurch ? 'purchasePreview' : 'salesPreview'); if (pv) { pv.style.display = 'none'; pv.innerHTML = ''; } }
+    const parsed = parseHistoryCSV(csvText, valueType);
+    mergeHistoryByCode(parsed.byCode, key, file.name, parsed.count);
     const { matched, unmatched } = applyHistoryOverride(historyOverride);
     saveHistoryOverride();
     if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--green)">${fmt(parsed.count)}</span> rows · ${fmt(parsed.parentCount)} parents · <span style="color:var(--accent)">${file.name}</span>`;
@@ -4359,7 +5214,8 @@ function handleHistFileTyped(file, valueType) {
     persistDatasetToMongo();
   }).catch(err => {
     if (subStatus) subStatus.innerHTML = `<strong>${label}</strong> — <span style="color:var(--red)">Error: ${err.message || 'failed to parse'}</span>`;
-  });
+  })
+  );
 }
 
 // Wire up
@@ -4509,8 +5365,15 @@ function assignDummyVendorNames() {
 
   console.info(`Dummy vendor rename: ${NEW_VENDORS.length} vendors applied (${NEW_VENDORS.map(v => v.name).join(', ')}).`);
 }
-// Vendor list is LOCKED to the 16 dealers above — always run, regardless of any Master upload.
-assignDummyVendorNames();
+// Vendor list is LOCKED to the 16 demo dealers — but ONLY in demo mode. When the persisted `D`
+// was built from the user's real uploads (D.__real), keep the real vendors and instead rehydrate
+// the in-memory realData store so further uploads rebuild correctly.
+if (D && D.__real) {
+  realDataMode = true;
+  rehydrateRealDataFromD();
+} else {
+  assignDummyVendorNames();
+}
 // Re-populate the category / vendor / folder autocomplete datalists now that D.vendors has been
 // replaced. (refreshFilterDatalists runs once during initial setup BEFORE this, so without this
 // extra call the vendor dropdown would still show stale embedded vendor names like "VND011 — …".)

@@ -4,6 +4,14 @@
 /* eslint-disable */
 export const DASHBOARD_HTML = `
 
+<!-- Processing loader overlay — shown while an uploaded file is being cleaned & the dashboard rebuilt -->
+<div id="processingOverlay" style="display:none;">
+  <div class="proc-box">
+    <div class="proc-spinner"></div>
+    <div class="proc-msg" id="processingMsg">Processing…</div>
+  </div>
+</div>
+
 <!-- Floating Reorder-Now total panel (draggable; defaults to right-middle of viewport) -->
 <div id="reorderFloatingTotal" aria-live="polite">
   <div class="rft-drag" title="Drag to reposition"><span>Drag</span><span class="rft-drag-handle">⠿</span></div>
@@ -498,7 +506,8 @@ export const DASHBOARD_HTML = `
       <div class="upload-meta">
         <div class="upload-status" id="uploadStatus">Using synthetic mapping — upload your real master CSV to swap in</div>
         <div class="upload-spec">
-          Required columns (case-insensitive headers): <strong style="color:var(--accent)">parent_id, parent_code, child_code, folder</strong><br>
+          <strong style="color:var(--accent)">Raw Product Master export?</strong> Just upload it — files with columns <span style="color:var(--text-2)">ProductId, Product Name, Parent Product, SupplierName, CreationDate, Category, Product Type</span> are auto-detected and cleaned for you (parent↔child resolved, blank/0-parent rows dropped). A cleaned preview appears below.<br><br>
+          Or upload an already-clean file. Required columns (case-insensitive headers): <strong style="color:var(--accent)">parent_id, parent_code, child_code, folder</strong><br>
           Optional: <strong style="color:var(--accent)">vendor_name</strong> (aliases: vendor, vendor_code) — overrides each parent's vendor<br>
           Optional: <strong style="color:var(--accent)">category</strong> (aliases: category_name, cat, product_category) — overrides each parent's category. Shown under the vendor in the row.<br>
           Optional: <strong style="color:var(--accent)">sub_category</strong> (aliases: subcategory, sub_cat, subcat, product_sub_category) — each parent's sub-category. Every product is in exactly one category and one sub-category.<br>
@@ -512,6 +521,7 @@ export const DASHBOARD_HTML = `
       <button class="upload-btn" id="uploadBtnTrigger">Choose CSV / Excel</button>
       <button class="reset-btn" id="masterReset" style="display:none;">Clear & reset</button>
     </div>
+    <div id="masterPreview" style="display:none; margin-top:14px;"></div>
   </div>
 </section>
 
@@ -530,7 +540,8 @@ export const DASHBOARD_HTML = `
       <div class="upload-meta">
         <div class="upload-status" id="stockUploadStatus">No stock override loaded — current values come from the embedded dataset</div>
         <div class="upload-spec">
-          Required column: <strong style="color:var(--accent)">parent_code</strong>. Optional (defaults to existing value if missing): <strong style="color:var(--accent)">on_hand, in_transit, pending, discontinued</strong>.
+          <strong style="color:var(--accent)">Raw Stock Master export?</strong> Just upload it — files with columns <span style="color:var(--text-2)">ProductID, Name, Stock</span> are auto-detected and the stock is <strong>summed per parent</strong> (a parent and its child codes are the same physical product, so they're counted once). <em>Requires the Product Master first.</em><br><br>
+          Or upload a clean file. Required column: <strong style="color:var(--accent)">parent_code</strong>. Optional (defaults to existing value if missing): <strong style="color:var(--accent)">on_hand, in_transit, pending, discontinued</strong>.
           <br>Headers are case-insensitive. Accepted aliases: <span style="color:var(--text-2)">on_hand → k, stock, qty, quantity</span> · <span style="color:var(--text-2)">in_transit → transit, it</span> · <span style="color:var(--text-2)">pending → po, pending_factory</span> · <span style="color:var(--text-2)">discontinued → disc, status (values: Y/N, 1/0, true/false, active/disc)</span>
         </div>
       </div>
@@ -540,6 +551,7 @@ export const DASHBOARD_HTML = `
       <button class="reset-btn" id="stockReset" style="display:none;">Clear & reset</button>
     </div>
     <div id="stockUploadDetail" style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin-top:10px; min-height:14px;"></div>
+    <div id="stockPreview" style="display:none; margin-top:14px;"></div>
   </div>
 </section>
 
@@ -556,8 +568,10 @@ export const DASHBOARD_HTML = `
 
     <div class="upload-status" id="histUploadStatus" style="margin-bottom:6px;">No history override loaded — using embedded 24-month data</div>
     <div class="upload-spec" style="margin-bottom:14px;">
-      Sales file columns: <strong style="color:var(--accent)">parent_code, month, sales</strong> · Purchases file columns: <strong style="color:var(--accent)">parent_code, month, purchases</strong><br>
-      Month formats accepted: <span style="color:var(--text-2)">"2025-04" · "Apr-25" · "Apr 2025" · "April 2025" · "4/2025" · "04/25"</span> · Active 24-month window: <strong style="color:var(--accent)" id="histWindowLabel">—</strong>
+      <strong style="color:var(--accent)">Raw ERP exports accepted.</strong> Drop your raw <strong>Sales</strong> or <strong>Purchase</strong> file straight into the matching box — files with columns <span style="color:var(--text-2)">Date, Product, Product Code, Qty, Company Name, PID</span> are auto-detected, mapped to their parent (via <strong>PID</strong>), aggregated by month, and previewed below. No pre-formatting needed. <em>Requires the Product Master to be cleaned first</em> (that builds the PID → parent map).<br><br>
+      Already-clean files also work. Sales columns: <strong style="color:var(--accent)">parent_code, month, sales</strong> · Purchases columns: <strong style="color:var(--accent)">parent_code, month, purchases</strong><br>
+      Month formats accepted: <span style="color:var(--text-2)">"2025-04" · "Apr-25" · "Apr 2025" · "April 2025" · "4/2025" · "04/25"</span> · Active 24-month window: <strong style="color:var(--accent)" id="histWindowLabel">—</strong><br>
+      <span style="color:var(--text-3)">Very large Excel exports (roughly &gt; 50&nbsp;MB) can exceed the browser's limit — if one won't load, save it as <strong>CSV</strong> and upload that (same columns).</span>
     </div>
 
     <div class="hist-split" style="display:grid; grid-template-columns:1fr 1fr; gap:14px;">
@@ -582,6 +596,8 @@ export const DASHBOARD_HTML = `
 
     <div style="margin-top:12px;"><button class="reset-btn" id="histReset" style="display:none;">Clear &amp; reset history</button></div>
     <div id="histUploadDetail" style="font-family:var(--mono); font-size:10px; color:var(--text-3); margin-top:10px; min-height:14px;"></div>
+    <div id="salesPreview" style="display:none; margin-top:14px;"></div>
+    <div id="purchasePreview" style="display:none; margin-top:14px;"></div>
   </div>
 </section>
 
